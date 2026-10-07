@@ -1,0 +1,173 @@
+# Builds a zip for every platform on every push: the fetch-pr-commentary binary plus
+# whatever make.sh's BUNDLE lists (just README.md, by default). The zips are
+# attached to the workflow run as artifacts, and a push to the master branch
+# also publishes them as a GitHub release.
+#
+# Release versions are VERSION (major.minor, bumped by hand) plus the run
+# number as the third part: 0.1.57. Every push to master is released, so the
+# run number is what tells those releases apart, and it keeps each release a
+# valid semantic version that GitHub sorts above the last.
+#
+# To ship more than the binary and the readme (config, templates, docs...),
+# list those files and folders in BUNDLE in make.sh and make.ps1. This
+# workflow needs no change for that: it releases whatever `make.sh dist`
+# makes. To publish something beside the zips, add it to `assets` in the
+# release job.
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+# Reading the repo is all this needs: uploading a run's artifacts is
+# authorised by the run itself, not by the token's permissions.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test ./...
+
+  package:
+    name: package (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+    # Every target is cross-compiled from Linux: zip(1) there is what keeps
+    # the binary's executable bit in the archive. (If the program ever needs
+    # cgo, this is the place to build on a runner per platform instead.)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Package
+        id: dist
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          # The version's third part, in the zip's name and in the binary.
+          BUILD: ${{ github.run_number }}
+        run: |
+          zip=$(./make.sh dist | tail -n 1)
+          echo "zip=$zip" >>"$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.dist.outputs.zip }}
+          # Upload the zip as it is: the artifact's own zipping would wrap it
+          # in a second zip, and drops file permissions besides.
+          archive: false
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: package
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    # Publishing a release creates its tag, which is a write to the repo;
+    # only this job asks for that.
+    permissions:
+      contents: write
+    # Two quick pushes must not race to publish.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: fetch-pr-commentary-*.zip
+          merge-multiple: true
+          path: dist
+          # Keep the zips as they are. Left to itself this unpacks each one
+          # into a folder, and re-zipping those would lose the executable
+          # bit the package job's zip(1) kept.
+          skip-decompress: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD: ${{ github.run_number }}
+        run: |
+          version="$(tr -d '[:space:]' <VERSION).$BUILD"
+          tag="v$version"
+          # Found rather than globbed at dist/*.zip, so it doesn't matter
+          # exactly where download-artifact puts them — and each one is
+          # checked to be a zip before anything is published.
+          mapfile -t zips < <(find dist -type f -name 'fetch-pr-commentary-*.zip' | sort)
+          if [ "${#zips[@]}" -eq 0 ]; then
+            echo "::error::no release zips found under dist/"
+            find dist -ls
+            exit 1
+          fi
+          # Published under fixed names (fetch-pr-commentary-linux-amd64.zip, ...), so
+          # releases/latest/download/<name> always works for the install
+          # scripts and `fetch-pr-commentary --upgrade`; the version is in the tag, in the
+          # folder inside each zip, and in `fetch-pr-commentary --version`. SHA256SUMS lets
+          # them check a download before unpacking it.
+          mkdir -p release
+          for zip in "${zips[@]}"; do
+            unzip -tq "$zip" >/dev/null || { echo "::error::$zip is not a valid zip"; exit 1; }
+            name=$(basename "$zip")
+            cp "$zip" "release/${name/-$version/}"
+          done
+          (cd release && sha256sum fetch-pr-commentary-*.zip >SHA256SUMS)
+          cat release/SHA256SUMS
+          # What gets attached to the release. Add other files here to
+          # publish them beside the zips.
+          assets=(release/fetch-pr-commentary-*.zip release/SHA256SUMS)
+          notes=$(cat <<EOF
+          To install:
+          - Linux/macOS: \`curl -fsSL https://raw.githubusercontent.com/fluffynuts/fetch-pr-commentary/master/install.sh | sh\`
+          - Windows: \`irm https://raw.githubusercontent.com/fluffynuts/fetch-pr-commentary/master/install.ps1 | iex\`
+          - Manual: download the zip for your platform (below), unzip it anywhere, and run
+            \`fetch-pr-commentary --install\` from the folder it makes.
+
+          To upgrade, run the same command again, or \`fetch-pr-commentary --upgrade\` once fetch-pr-commentary is installed.
+
+          | Platform | Zip |
+          |---|---|
+          | Linux (x86-64) | \`fetch-pr-commentary-linux-amd64.zip\` |
+          | Linux (ARM) | \`fetch-pr-commentary-linux-arm64.zip\` |
+          | macOS (Apple Silicon) | \`fetch-pr-commentary-macos-arm64.zip\` |
+          | macOS (Intel) | \`fetch-pr-commentary-macos-amd64.zip\` |
+          | Windows (x86-64) | \`fetch-pr-commentary-windows-amd64.zip\` |
+          | Windows (ARM) | \`fetch-pr-commentary-windows-arm64.zip\` |
+
+          \`SHA256SUMS\` holds each zip's checksum. The install scripts and \`fetch-pr-commentary --upgrade\` check it.
+
+          macOS: the binary isn't signed, so if it's blocked after downloading in a browser, run
+          \`xattr -dr com.apple.quarantine <folder>\` once.
+          EOF
+          )
+          # A re-run of the same workflow run finds its release already made,
+          # and replaces the zips rather than failing.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "fetch-pr-commentary $version" \
+              --notes "$notes" \
+              --generate-notes \
+              --latest
+          fi
